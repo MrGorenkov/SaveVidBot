@@ -1,14 +1,17 @@
+# main.py
 import logging
 import re
 import os
+import shutil
 import asyncio
 import yt_dlp
 import json
 from datetime import datetime
+from typing import Optional, Tuple
+
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
-from typing import Optional, Tuple
 
 # ----------------- ЛОГИ -----------------
 logging.basicConfig(
@@ -19,17 +22,16 @@ logger = logging.getLogger(__name__)
 
 # ----------------- FFMPEG (для Render/без root) -----------------
 # imageio-ffmpeg приносит статический ffmpeg — укажем путь yt-dlp.
+FFMPEG_PATH = None
 try:
     import imageio_ffmpeg
     FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
-    os.environ["FFMPEG_LOCATION"] = FFMPEG_PATH  # на всякий случай для сторонних библ.
+    os.environ["FFMPEG_LOCATION"] = FFMPEG_PATH  # для сторонних библ.
     logger.info(f"FFmpeg resolved at: {FFMPEG_PATH}")
 except Exception as e:
     logger.warning(f"FFmpeg not resolved from imageio-ffmpeg: {e}")
-    FFMPEG_PATH = None
 
 # ----------------- ТОКЕН -----------------
-# ВАЖНО: не храним токен в коде! На Render передай TELEGRAM_BOT_TOKEN в переменных окружения.
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 if not TOKEN:
     logger.error("TELEGRAM_BOT_TOKEN is not set in environment!")
@@ -81,54 +83,88 @@ def build_ydl_opts_base() -> dict:
             'Sec-Fetch-Mode': 'navigate',
         },
         'extractor_args': {
-            # Уменьшает шанс "Sign in to confirm you're not a bot"/возрастных проверок
+            # уменьшает шанс "Sign in to confirm you're not a bot"/age-gate
             'youtube': {'player_client': ['android', 'ios']},
             'tiktok': {'webpage_download_timeout': 30}
         },
         'logger': logger,
+        'writeinfojson': False,
     }
     if FFMPEG_PATH:
         opts['ffmpeg_location'] = FFMPEG_PATH
     return opts
 
 
+def _copy_cookiefile_to_tmp(src_path: str) -> str:
+    """
+    Делаем рабочую копию cookie-файла в /tmp:
+    - Secret Files на Render read-only → никогда не пишем в /etc/secrets/*
+    - добавляем заголовок Netscape при его отсутствии
+    """
+    dst_path = "/tmp/cookies_runtime.txt"
+    with open(src_path, "rb") as s, open(dst_path, "wb") as d:
+        data = s.read()
+        if not data.startswith(b"# Netscape HTTP Cookie File"):
+            d.write(b"# Netscape HTTP Cookie File\n")
+        d.write(data)
+    return dst_path
+
+
+def _resolve_cookiefile() -> Optional[str]:
+    """
+    Возвращает путь к РАБОЧЕЙ копии cookies в /tmp (если исходный файл существует).
+    Порядок: YTDLP_COOKIES_FILE → ./cookies.txt → None
+    """
+    src = os.getenv("YTDLP_COOKIES_FILE")
+    if src and os.path.exists(src):
+        try:
+            return _copy_cookiefile_to_tmp(src)
+        except Exception as e:
+            logger.warning(f"Failed to copy env cookiefile to /tmp: {e}")
+            return src  # fallback: хоть так, но не будем править оригинал
+
+    local = os.path.join(os.getcwd(), "cookies.txt")
+    if os.path.exists(local):
+        try:
+            return _copy_cookiefile_to_tmp(local)
+        except Exception as e:
+            logger.warning(f"Failed to copy local cookiefile to /tmp: {e}")
+            return local
+
+    return None
+
+
 def get_ydl_opts_with_cookies(url: str) -> dict:
     """
-    1) Если есть env YTDLP_COOKIES_FILE — используем его.
-    2) Если в корне есть cookies.txt — используем его.
-    3) Пытаемся взять куки из локального браузера (на Render обычно нет профиля).
-    4) Фолбэк без куки.
+    1) Пробуем cookie-файл (через /tmp-копию)
+    2) (локально) cookies из браузера
+    3) Фолбэк без куки
     """
     base = build_ydl_opts_base()
 
-    cookiefile_env = os.getenv("YTDLP_COOKIES_FILE")
-    if cookiefile_env and os.path.exists(cookiefile_env):
-        logger.info(f"Using cookies file from env: {cookiefile_env}")
-        base['cookiefile'] = cookiefile_env
+    # 1) cookie-файл
+    cf = _resolve_cookiefile()
+    if cf and os.path.exists(cf):
+        logger.info(f"Using cookies file: {cf}")
+        base['cookiefile'] = cf
         return base
 
-    local_cookiefile = os.path.join(os.getcwd(), "cookies.txt")
-    if os.path.exists(local_cookiefile):
-        logger.info(f"Using local cookies.txt: {local_cookiefile}")
-        base['cookiefile'] = local_cookiefile
-        return base
-
-    # Попытка из браузера (актуально для локальной машины разработчика)
+    # 2) Попытка взять куки из установленного браузера (на Render профилей обычно нет)
     browsers_to_try = [
         ('firefox', None, None, None),
         ('chrome', None, None, None),
         ('safari', None, None, None),
     ]
-    for browser_tuple in browsers_to_try:
+    for b in browsers_to_try:
         try:
             test_opts = build_ydl_opts_base()
-            test_opts['cookiesfrombrowser'] = browser_tuple
+            test_opts['cookiesfrombrowser'] = b
             with yt_dlp.YoutubeDL(test_opts) as ydl:
                 ydl.extract_info(url, download=False)
-                logger.info(f"Successfully using {browser_tuple[0]} cookies")
+                logger.info(f"Successfully using {b[0]} cookies")
                 return test_opts
         except Exception as e:
-            logger.debug(f"No browser cookies from {browser_tuple[0]}: {e}")
+            logger.debug(f"No browser cookies from {b[0]}: {e}")
 
     logger.info("Proceeding without cookies (may fail on YouTube).")
     return base
@@ -146,7 +182,6 @@ async def download_video(url: str) -> Tuple[Optional[Tuple[str, str]], Optional[
 
                 try:
                     info = ydl.extract_info(url, download=False)
-                    # Плейлисты/entries → берём первый элемент
                     if info.get('entries'):
                         info = info['entries'][0]
                     logger.debug(f"Video info extracted: {info.get('title', 'Unknown')}")
@@ -173,19 +208,19 @@ async def download_video(url: str) -> Tuple[Optional[Tuple[str, str]], Optional[
                             filename = test_filename
                             break
 
-                # Переименуем в .mp4 при необходимости (без перекодирования)
+                # Переименуем в .mp4 (без перекодирования), если нужно
                 if not filename.endswith('.mp4'):
-                    base, ext = os.path.splitext(filename)
-                    new_filename = f"{base}.mp4"
-                    if os.path.exists(filename):
-                        try:
+                    base_name, _ = os.path.splitext(filename)
+                    new_filename = f"{base_name}.mp4"
+                    try:
+                        if os.path.exists(filename):
                             os.rename(filename, new_filename)
-                            filename = new_filename
-                        except Exception:
-                            # Если нельзя просто переименовать — оставим исходное имя
+                        elif os.path.exists(new_filename):
                             pass
-                    elif os.path.exists(new_filename):
                         filename = new_filename
+                    except Exception:
+                        # Если переименовать нельзя — оставим исходное имя
+                        pass
 
                 logger.debug(
                     f"Downloaded file: {filename}, size: {os.path.getsize(filename) if os.path.exists(filename) else 'N/A'} bytes")
@@ -203,8 +238,10 @@ async def download_video(url: str) -> Tuple[Optional[Tuple[str, str]], Optional[
     except yt_dlp.utils.ExtractorError as e:
         logger.error(f"Extractor error: {e}")
         msg = str(e)
+        if "The provided YouTube account cookies are no longer valid" in msg:
+            return None, "Куки YouTube устарели — экспортируй новые (cookies.txt) и перезалей."
         if "Sign in to confirm you’re not a bot" in msg or "Sign in to confirm you're not a bot" in msg:
-            return None, "YouTube требует авторизацию (нужен cookies.txt)."
+            return None, "YouTube требует авторизацию (cookies.txt)."
         if "Requested format is not available" in msg:
             return None, "Запрашиваемый формат недоступен. Попробуй другое видео."
         return None, f"Ошибка извлечения видео: {msg}"
@@ -425,10 +462,10 @@ async def handle_message(message: types.Message):
     else:
         hint = ""
         if error_msg and "cookies" in error_msg.lower():
-            hint = "\n\n💡 Решение: загрузи cookies.txt в Render и задай переменную YTDLP_COOKIES_FILE (см. инструкцию)."
+            hint = "\n\n💡 Решение: загрузите свежий cookies.txt (Netscape) и укажите YTDLP_COOKIES_FILE."
         reply_text = (
             "❌ Не удалось скачать видео. Проверь ссылку или попробуй позже.\n"
-            "💡 Часто помогает обновление yt-dlp до dev-версии."
+            "💡 Часто помогает dev-версия yt-dlp и свежие куки."
             f"{hint}"
         )
         if error_msg:

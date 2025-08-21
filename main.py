@@ -5,7 +5,7 @@ import sys
 import asyncio
 import json
 from datetime import datetime
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 import yt_dlp
 from aiogram import Bot, Dispatcher, types, F
@@ -15,31 +15,31 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 # =========================
 # НАСТРОЙКИ / ENV
 # =========================
-# 1) Telegram токен:
-#    - Рекомендуется задать ENV: TELEGRAM_BOT_TOKEN
-#    - Либо вписать сюда в константу TOKEN_FALLBACK
-TOKEN_FALLBACK = ""  # <-- можешь вписать токен сюда, если не хочешь через ENV
 
-# 2) Путь к cookies (Netscape):
-#    - По умолчанию ищем: ENV COOKIES_PATH -> /etc/secrets/cookies.txt -> /mnt/data/cookies.txt
-#    - Файл ДОЛЖЕН начинаться строкой "# Netscape HTTP Cookie File" или "# HTTP Cookie File"
+# 1) Telegram токен: ENV TELEGRAM_BOT_TOKEN или сюда в fallback
+TOKEN_FALLBACK = ""  # можно вписать токен сюда, если не используешь ENV
+
+# 2) Куки (Netscape). Ищем здесь по порядку.
 DEFAULT_COOKIES_CANDIDATES = [
-    "/etc/secrets/cookies.txt",
-    "/mnt/data/cookies.txt",
+    "/mnt/data/cookies.txt",      # << приоритетно (загруженный файл)
+    # "/etc/secrets/cookies.txt", # НЕ используем, чтобы не ловить read-only
 ]
 
-# 3) YouTube poToken (web):
-#    - ENV: PO_TOKEN_WEB (значение БЕЗ префикса "web+")
-#    - Токен берется через HAR/Network или скриптом из браузера
-#    - При наличии будет добавлен как "web+<токен>"
-PO_TOKEN_ENV_NAME = "PO_TOKEN_WEB"
+# 3) PO Token:
+#    - Вариант А (рекомендуется): ENV PO_TOKEN_RAW = "<сам токен без префикса>"
+#      + ENV PO_TOKEN_CONTEXT = "web" ИЛИ "web.remix"
+#    - Вариант Б: ENV PO_TOKEN_FULL = "web+<токен>" или "web.remix+<токен>"
+#    - Совместимость: если задан YTDLP_PO_TOKENS — тоже примем.
+PO_TOKEN_RAW_ENV = "PO_TOKEN_RAW"
+PO_TOKEN_CONTEXT_ENV = "PO_TOKEN_CONTEXT"  # web | web.remix
+PO_TOKEN_FULL_ENV = "PO_TOKEN_FULL"        # уже вида CLIENT.CONTEXT+TOKEN
+PO_TOKEN_COMPAT_ENV = "YTDLP_PO_TOKENS"    # на всякий случай (если уже есть)
 
-# 4) User-Agent (желательно тот же браузера, из которого брали poToken/cookies)
+# 4) User-Agent (лучше тот же, что в браузере с poToken/cookies)
 DEFAULT_UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
     "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.6 Safari/605.1.15"
 )
-
 
 # =========================
 # ЛОГИРОВАНИЕ
@@ -54,7 +54,6 @@ logger = logging.getLogger(__name__)
 # ФАЙЛ ДЛЯ СТАТИСТИКИ
 # =========================
 USER_STATS_FILE = "user_stats.json"
-
 
 # =========================
 # УТИЛИТЫ
@@ -71,15 +70,16 @@ def get_telegram_token() -> str:
 
 def find_cookiefile() -> Optional[str]:
     """Возвращает путь к валидному Netscape cookies.txt или None."""
-    # явный путь из ENV
     env_path = os.getenv("COOKIES_PATH", "").strip()
-    candidates = []
+    candidates: List[str] = []
     if env_path:
         candidates.append(env_path)
     candidates.extend(DEFAULT_COOKIES_CANDIDATES)
 
     for p in candidates:
-        if p and os.path.isfile(p):
+        if not p:
+            continue
+        if os.path.isfile(p):
             try:
                 with open(p, "r", encoding="utf-8", errors="ignore") as f:
                     first = f.readline().strip()
@@ -92,6 +92,35 @@ def find_cookiefile() -> Optional[str]:
                 logger.warning(f"Cannot read cookies file {p}: {e}")
     logger.warning("No valid Netscape cookies file found. Proceeding without cookies.")
     return None
+
+
+def build_po_token_entry() -> Optional[str]:
+    """
+    Возвращает строку формата 'CLIENT.CONTEXT+TOKEN' (например 'web+AAA' или 'web.remix+AAA')
+    или None, если токенов нет.
+    """
+    full = os.getenv(PO_TOKEN_FULL_ENV, "").strip()
+    if not full:
+        full = os.getenv(PO_TOKEN_COMPAT_ENV, "").strip()  # совместимость, если вдруг задано
+    if full:
+        if "+" not in full:
+            logger.warning(f"{PO_TOKEN_FULL_ENV} задан, но без '+': ожидается 'CLIENT.CONTEXT+TOKEN'")
+            return None
+        logger.info(f"Using PO token (full, context already provided): {full.split('+')[0]}+***")
+        return full
+
+    raw = os.getenv(PO_TOKEN_RAW_ENV, "").strip()
+    if not raw:
+        return None
+
+    context = os.getenv(PO_TOKEN_CONTEXT_ENV, "web").strip()  # web | web.remix
+    if context not in ("web", "web.remix"):
+        logger.warning(f"Неизвестный PO_TOKEN_CONTEXT='{context}', используем 'web'")
+        context = "web"
+
+    entry = f"{context}+{raw}"
+    logger.info(f"Using PO token (built): {context}+***")
+    return entry
 
 
 def is_valid_url(url: str) -> bool:
@@ -143,7 +172,6 @@ def update_user_stats(user_id: int, platform: str, file_size: int = 0):
     stats[user_id_str]["downloads_count"] += 1
     stats[user_id_str]["total_size"] += file_size
     stats[user_id_str]["last_activity"] = datetime.now().isoformat()
-
     stats[user_id_str]["platforms"][platform] = stats[user_id_str]["platforms"].get(platform, 0) + 1
 
     save_user_stats(stats)
@@ -184,16 +212,11 @@ def format_file_size(size_bytes: int) -> str:
 # СКАЧИВАНИЕ ВИДЕО
 # =========================
 async def download_video(url: str) -> Tuple[Optional[Tuple[str, str]], Optional[str]]:
-    # poToken (web) из ENV, добавим префикс 'web+'
-    po_token_raw = os.getenv(PO_TOKEN_ENV_NAME, "").strip()
-    po_token_full = f"web+{po_token_raw}" if po_token_raw else ""
-
-    # User-Agent из ENV или дефолт
+    po_entry = build_po_token_entry()  # 'web+AAA...' или 'web.remix+AAA...' или None
     YTDLP_UA = os.getenv("YTDLP_UA", DEFAULT_UA).strip()
-
-    # Cookies (Netscape)
     cookiefile = find_cookiefile()
 
+    # базовые опции
     ydl_opts = {
         "format": "best[height<=720][filesize<50M]/best[filesize<50M]/best",
         "outtmpl": "downloaded_video.%(ext)s",
@@ -203,7 +226,7 @@ async def download_video(url: str) -> Tuple[Optional[Tuple[str, str]], Optional[
         "verbose": True,
         "noplaylist": True,
         "max_filesize": 50 * 1024 * 1024,
-        "http_chunk_size": 10 * 1024 * 1024,  # <= 10MB — анти-throttle на YouTube
+        "http_chunk_size": 10 * 1024 * 1024,  # <= 10MB
         "user_agent": YTDLP_UA,
         "logger": logger,
         "socket_timeout": 15,
@@ -216,19 +239,22 @@ async def download_video(url: str) -> Tuple[Optional[Tuple[str, str]], Optional[
             "Sec-Fetch-Mode": "navigate",
         },
         "extractor_args": {
-            "tiktok": {"webpage_download_timeout": 30},
+            # Используем web-клиент (чтобы poToken применился)
             "youtube": {
-                # просим web-клиент (совместим с poToken)
-                "player_client": ["web", "default"],
-                **({"po_token": po_token_full} if po_token_full else {}),
+                "player_client": ["web"],  # без 'tv' — чтобы не уходило в TV
             },
-            # для вкладок/плейлистов (на всякий)
-            "youtubetab": ({ "po_token": po_token_full } if po_token_full else {}),
         },
     }
 
+    # куки только для чтения (никаких /etc/secrets)
     if cookiefile:
         ydl_opts["cookiefile"] = cookiefile
+
+    # poToken: ДОЛЖЕН быть СПИСКОМ строк 'CLIENT.CONTEXT+TOKEN'
+    if po_entry:
+        ydl_opts["extractor_args"]["youtube"]["po_token"] = [po_entry]
+        # для вкладок/плейлистов — иногда требуется
+        ydl_opts["extractor_args"]["youtubetab"] = {"po_token": [po_entry]}
 
     try:
         loop = asyncio.get_running_loop()
@@ -237,15 +263,10 @@ async def download_video(url: str) -> Tuple[Optional[Tuple[str, str]], Optional[
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 logger.debug(f"Starting download for URL: {url}")
 
-                # 1) Сначала пробуем достать info БЕЗ скачивания — оценим размер
-                try:
-                    info = ydl.extract_info(url, download=False)
-                    logger.debug(f"Video info extracted: {info.get('title', 'Unknown')}")
-                except Exception as e:
-                    logger.error(f"Failed to extract info: {e}")
-                    raise
+                # 1) Получим info без скачивания (оценка размера)
+                info = ydl.extract_info(url, download=False)
+                logger.debug(f"Video info extracted: {info.get('title', 'Unknown')}")
 
-                # Размер может быть в разных полях, но часто None — проверим только если есть
                 filesize = info.get("filesize") or info.get("filesize_approx")
                 if filesize and filesize > 50 * 1024 * 1024:
                     raise Exception("Видео превышает максимальный размер (50 МБ)")
@@ -254,7 +275,7 @@ async def download_video(url: str) -> Tuple[Optional[Tuple[str, str]], Optional[
                 info = ydl.extract_info(url, download=True)
                 filename = ydl.prepare_filename(info)
 
-                # Попробуем найти реальный файл (иногда расширение отличается)
+                # если название с другим расширением — попробуем угадать
                 if not os.path.exists(filename):
                     base = os.path.splitext(filename)[0]
                     for ext in [".mp4", ".webm", ".mkv", ".avi"]:
@@ -263,23 +284,18 @@ async def download_video(url: str) -> Tuple[Optional[Tuple[str, str]], Optional[
                             filename = test
                             break
 
-                # Приведем к .mp4, если возможно
-                if not filename.endswith(".mp4"):
-                    base, ext = os.path.splitext(filename)
+                # стараемся иметь .mp4 (без записи куда-либо кроме рабочей директории)
+                if not filename.endswith(".mp4") and os.path.exists(filename):
+                    base, _ = os.path.splitext(filename)
                     new_filename = f"{base}.mp4"
-                    if os.path.exists(filename):
-                        try:
-                            os.rename(filename, new_filename)
-                            filename = new_filename
-                        except Exception:
-                            # если переименовать нельзя — оставляем как есть
-                            pass
-                    elif os.path.exists(new_filename):
+                    try:
+                        os.rename(filename, new_filename)
                         filename = new_filename
+                    except Exception:
+                        pass
 
                 size_after = os.path.getsize(filename) if os.path.exists(filename) else 0
                 logger.debug(f"Downloaded file: {filename}, size: {size_after} bytes")
-
                 return filename, info.get("title", "video")
 
         result = await loop.run_in_executor(None, sync_download)
@@ -288,33 +304,31 @@ async def download_video(url: str) -> Tuple[Optional[Tuple[str, str]], Optional[
     except yt_dlp.utils.MaxDownloadsReached:
         logger.error("File exceeds max size")
         return None, "Видео превышает максимальный размер (50 МБ)."
-
     except yt_dlp.utils.UnsupportedError as e:
         logger.error(f"Unsupported URL or format: {e}")
         return None, "Неподдерживаемая платформа или формат видео."
-
     except yt_dlp.utils.ExtractorError as e:
         logger.error(f"Extractor error: {e}")
         msg = str(e)
         if "Sign in to confirm you’re not a bot" in msg or "Sign in to confirm you're not a bot" in msg:
-            hint = "Проверь cookies.txt (Netscape) и poToken (PO_TOKEN_WEB). Обнови их из того же браузера/профиля."
-            return None, f"Требуется вход (anti-bot). {hint}"
-        if "Requested format is not available" in msg:
-            return None, "Запрашиваемый формат недоступен. Попробуй другое видео."
+            return None, "Требуется вход (anti-bot). Проверь cookies.txt (Netscape) и poToken."
+        if "Invalid po_token configuration format" in msg:
+            return None, "Неверный формат poToken. Нужен вид 'CLIENT.CONTEXT+TOKEN' (например, 'web+AAA' или 'web.remix+AAA')."
         if "The provided YouTube account cookies are no longer valid" in msg:
             return None, "Куки протухли. Экспортируй свежие cookies и замени файл."
         return None, f"Ошибка извлечения видео: {msg}"
-
     except Exception as e:
         logger.error(f"Error downloading video: {e}")
-        error_msg = str(e)
-        if "Video unavailable" in error_msg:
+        err = str(e)
+        if "Read-only file system" in err and "/etc/secrets/cookies.txt" in err:
+            return None, "Нельзя писать в /etc/secrets. Положи cookies в /mnt/data/cookies.txt и укажи COOKIES_PATH."
+        if "Video unavailable" in err:
             return None, "Видео недоступно или удалено."
-        if "Private video" in error_msg:
-            return None, "Видео является приватным."
-        if "age" in error_msg.lower():
-            return None, "Видео имеет возрастные ограничения."
-        return None, f"Ошибка скачивания: {error_msg}"
+        if "Private video" in err:
+            return None, "Видео приватное."
+        if "age" in err.lower():
+            return None, "Видео с возрастными ограничениями."
+        return None, f"Ошибка скачивания: {err}"
 
 
 # =========================
@@ -330,11 +344,10 @@ async def start(message: types.Message):
         inline_keyboard=[[InlineKeyboardButton(text="📊 Моя статистика", callback_data="show_stats")]]
     )
     await message.reply(
-        "🎥 Привет! Я раб Санька — бот для скачивания видео!\n\n"
-        "📱 Поддерживаемые платформы:\n"
-        "• YouTube • TikTok • Instagram • Twitter/X • Facebook • и др.\n\n"
-        "📤 Пришли ссылку на видео — я скачаю и пришлю файл.\n"
-        "⚠️ Максимальный размер файла: 50 МБ.",
+        "🎥 Привет! Я бот для скачивания видео.\n\n"
+        "📱 Поддержка: YouTube, TikTok, Instagram, Twitter/X, Facebook и др.\n"
+        "⚠️ Лимит размера: 50 МБ.\n\n"
+        "Просто пришли ссылку.",
         reply_markup=keyboard,
     )
 
@@ -351,12 +364,11 @@ async def show_stats_callback(callback: types.CallbackQuery):
 
     first_use = datetime.fromisoformat(stats["first_use"]).strftime("%d.%m.%Y")
     last_activity = datetime.fromisoformat(stats["last_activity"]).strftime("%d.%m.%Y %H:%M")
-
+    favorite_platform = "Нет данных"
+    favorite_count = 0
     if stats["platforms"]:
         favorite_platform = max(stats["platforms"], key=stats["platforms"].get)
         favorite_count = stats["platforms"][favorite_platform]
-    else:
-        favorite_platform, favorite_count = "Нет данных", 0
 
     stats_text = (
         f"📊 **Твоя статистика:**\n\n"
@@ -367,14 +379,12 @@ async def show_stats_callback(callback: types.CallbackQuery):
         f"🕐 Последняя активность: **{last_activity}**\n\n"
         f"🎯 **По платформам:**\n"
     )
-
     for platform, count in stats["platforms"].items():
         stats_text += f"• {platform}: {count} видео\n"
 
     try:
         await callback.message.edit_text(stats_text, parse_mode="Markdown")
-    except Exception as e:
-        logger.error(f"Error editing stats message: {e}")
+    except Exception:
         await callback.message.answer(stats_text, parse_mode="Markdown")
 
 
@@ -385,7 +395,7 @@ async def handle_message(message: types.Message):
 
     if not is_valid_url(url):
         await message.reply(
-            "❌ Пожалуйста, отправь корректную ссылку на видео.\n\n"
+            "❌ Пришли корректную ссылку на видео.\n\n"
             "Примеры:\n"
             "• https://www.youtube.com/watch?v=...\n"
             "• https://www.tiktok.com/@user/video/...\n"
@@ -394,30 +404,23 @@ async def handle_message(message: types.Message):
         )
         return
 
-    processing_msg = await message.reply("⏳ Обрабатываю ссылку, скачиваю видео...")
+    processing_msg = await message.reply("⏳ Скачиваю...")
 
     result, error_msg = await download_video(url)
     if result:
         filename, title = result
         try:
             if not os.path.exists(filename):
-                logger.error(f"File {filename} does not exist after download")
-                await processing_msg.edit_text("❌ Ошибка: скачанный файл не найден. Попробуй другую ссылку.")
+                await processing_msg.edit_text("❌ Ошибка: файл не найден после скачивания.")
                 return
 
             file_size = os.path.getsize(filename)
-            logger.debug(f"File size: {file_size} bytes")
-
             if file_size > 50 * 1024 * 1024:
-                logger.error(f"File too large: {file_size} bytes")
-                await processing_msg.edit_text(
-                    "❌ Видео слишком большое для Telegram (макс. 50 МБ). Попробуй другое видео."
-                )
+                await processing_msg.edit_text("❌ Видео слишком большое для Telegram (макс. 50 МБ).")
                 os.remove(filename)
                 return
 
             await processing_msg.edit_text("📤 Отправляю видео...")
-
             keyboard = InlineKeyboardMarkup(
                 inline_keyboard=[[InlineKeyboardButton(text="📊 Моя статистика", callback_data="show_stats")]]
             )
@@ -429,28 +432,22 @@ async def handle_message(message: types.Message):
                 reply_markup=keyboard,
             )
 
-            # Обновляем статистику
-            platform = detect_platform(url)
-            update_user_stats(user_id, platform, file_size)
-
-            logger.debug(f"Video sent successfully: {filename}")
+            update_user_stats(user_id, detect_platform(url), file_size)
             os.remove(filename)
             await processing_msg.delete()
 
         except Exception as e:
-            logger.error(f"Error sending video: {e}")
-            await processing_msg.edit_text(f"❌ Не удалось отправить видео: {str(e)}. Попробуй другую ссылку.")
+            await processing_msg.edit_text(f"❌ Не удалось отправить видео: {str(e)}.")
             if os.path.exists(filename):
                 try:
                     os.remove(filename)
                 except Exception:
                     pass
     else:
-        # дружелюбный вывод + подсказка про poToken/cookies
-        base = "❌ Не удалось скачать видео. Попробуй позже или другую ссылку."
-        hint = "\n\n💡 Проверь cookies.txt (формат Netscape) и/или добавь PO_TOKEN_WEB."
+        base = "❌ Не удалось скачать видео."
+        hint = "\n\n💡 Проверь cookies.txt (Netscape) и poToken."
         if error_msg:
-            base += f"\n\n🔍 Детали ошибки: {error_msg}"
+            base += f"\n\n🔍 Детали: {error_msg}"
         else:
             base += hint
         await processing_msg.edit_text(base)

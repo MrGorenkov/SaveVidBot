@@ -68,34 +68,31 @@ async def download_video(url: str) -> Tuple[Optional[Tuple[str, str, str]], Opti
         # Firefox works best according to FAQ
         browsers_to_try = [
             ('firefox', 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:133.0) Gecko/20100101 Firefox/133.0'),
-            ('safari',
-             'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.2 Safari/605.1.15'),
-            ('chrome',
-             'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36')
+            ('safari', 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.2 Safari/605.1.15'),
+            ('chrome', 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36')
         ]
-
+        
         for browser, user_agent in browsers_to_try:
             try:
                 logger.debug(f"Trying {browser} cookies with matching user-agent...")
                 opts = base_ydl_opts.copy()
                 opts['cookiesfrombrowser'] = (browser, None, None, None)
                 opts['user_agent'] = user_agent
-
+                
                 # Test if cookies work by trying to extract info without downloading
                 with yt_dlp.YoutubeDL(opts) as ydl:
                     ydl.extract_info(url, download=False)
                     logger.info(f"Successfully using {browser} cookies")
                     return opts
-
+                    
             except Exception as e:
                 logger.debug(f"Failed with {browser}: {e}")
                 continue
-
+        
         # Fallback without cookies but with a good user-agent
         logger.info("Using fallback without cookies")
         opts = base_ydl_opts.copy()
-        opts[
-            'user_agent'] = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+        opts['user_agent'] = 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
         return opts
 
     try:
@@ -103,7 +100,7 @@ async def download_video(url: str) -> Tuple[Optional[Tuple[str, str, str]], Opti
 
         def sync_download():
             final_ydl_opts = get_ydl_opts_with_cookies()
-
+            
             with yt_dlp.YoutubeDL(final_ydl_opts) as ydl:
                 logger.debug(f"Starting download for URL: {url}")
 
@@ -124,10 +121,10 @@ async def download_video(url: str) -> Tuple[Optional[Tuple[str, str, str]], Opti
                 # Download the media
                 with yt_dlp.YoutubeDL(final_ydl_opts) as ydl_download:
                     info = ydl_download.extract_info(url, download=True)
-
+                    
                     if info.get('entries'):
                         info = info['entries'][0]
-
+                    
                     filename = ydl_download.prepare_filename(info)
 
                     # Find the actual downloaded file
@@ -160,7 +157,7 @@ async def download_video(url: str) -> Tuple[Optional[Tuple[str, str, str]], Opti
     except Exception as e:
         logger.error(f"Error downloading media: {str(e)}")
         error_msg = str(e)
-
+        
         if "Unable to extract webpage video data" in error_msg and "tiktok" in url.lower():
             return None, (
                 "TikTok изменил защиту от ботов. Для решения:\n\n"
@@ -254,15 +251,15 @@ def format_file_size(size_bytes: int) -> str:
     """Форматирует размер файла в читаемый вид"""
     if size_bytes == 0:
         return "0 Б"
-
+    
     size_names = ["Б", "КБ", "МБ", "ГБ", "ТБ"]
     i = 0
     size = float(size_bytes)
-
+    
     while size >= 1024.0 and i < len(size_names) - 1:
         size /= 1024.0
         i += 1
-
+    
     return f"{size:.1f} {size_names[i]}"
 
 

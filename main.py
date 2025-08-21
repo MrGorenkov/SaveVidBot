@@ -63,43 +63,6 @@ async def download_video(url: str) -> Tuple[Optional[Tuple[str, str, str]], Opti
         'ignoreerrors': False,
     }
 
-    def is_photo_url(url: str, info: dict = None) -> bool:
-        """Detect if URL or content is a photo"""
-        # Check URL patterns for photos
-        photo_patterns = [
-            r'/photo/',  # TikTok photos
-            r'/p/',  # Instagram posts (can be photos)
-            r'/img/',  # Generic image URLs
-        ]
-
-        for pattern in photo_patterns:
-            if pattern in url.lower():
-                return True
-
-        # Check info metadata if available
-        if info:
-            # Check if it's explicitly marked as image
-            if info.get('ext') in ['jpg', 'jpeg', 'png', 'webp', 'gif', 'bmp']:
-                return True
-
-            # Check duration - photos usually have no duration or very short
-            duration = info.get('duration')
-            if duration is None or duration == 0:
-                return True
-
-            # Check if it's a TikTok photo slideshow
-            if 'tiktok' in url.lower() and info.get('entries'):
-                # TikTok photo carousels have multiple entries
-                return True
-
-            # Check Instagram photo indicators
-            if 'instagram' in url.lower():
-                media_type = info.get('media_type')
-                if media_type == 'image' or 'photo' in str(info.get('description', '')).lower():
-                    return True
-
-        return False
-
     def get_ydl_opts_with_cookies():
         """Try cookies from browsers following official FAQ recommendations"""
         # Firefox works best according to FAQ
@@ -151,46 +114,30 @@ async def download_video(url: str) -> Tuple[Optional[Tuple[str, str, str]], Opti
                 if filesize and filesize > 50 * 1024 * 1024:
                     raise Exception("Медиа превышает максимальный размер (50 МБ)")
 
+                # Determine media type
                 media_type = 'video'
-                if is_photo_url(url, info):
+                if '/photo/' in url or info.get('ext') in ['jpg', 'jpeg', 'png', 'webp', 'gif']:
                     media_type = 'photo'
-                    # Special format selection for photos
                     final_ydl_opts['format'] = 'best'
                     final_ydl_opts['merge_output_format'] = None
-                    # For TikTok photo carousels, get all images
-                    if 'tiktok' in url.lower() and '/photo/' in url:
-                        final_ydl_opts['writesubtitles'] = False
-                        final_ydl_opts['writeautomaticsub'] = False
 
                 # Download the media
                 with yt_dlp.YoutubeDL(final_ydl_opts) as ydl_download:
                     info = ydl_download.extract_info(url, download=True)
 
                     if info.get('entries'):
-                        # For carousels, take the first image or best quality
-                        if media_type == 'photo':
-                            # Find the best quality image from carousel
-                            best_entry = None
-                            for entry in info['entries']:
-                                if not best_entry or (entry.get('width', 0) > best_entry.get('width', 0)):
-                                    best_entry = entry
-                            info = best_entry or info['entries'][0]
-                        else:
-                            info = info['entries'][0]
+                        info = info['entries'][0]
 
                     filename = ydl_download.prepare_filename(info)
 
                     # Find the actual downloaded file
                     if not os.path.exists(filename):
                         base_name = os.path.splitext(filename)[0]
-                        extensions = ['.mp4', '.webm', '.mkv', '.avi', '.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp',
-                                      '.tiff']
+                        extensions = ['.mp4', '.webm', '.mkv', '.avi', '.jpg', '.jpeg', '.png', '.webp', '.gif']
                         for ext in extensions:
                             test_filename = base_name + ext
                             if os.path.exists(test_filename):
                                 filename = test_filename
-                                if ext.lower() in ['.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp', '.tiff']:
-                                    media_type = 'photo'
                                 break
 
                     logger.debug(f"Downloaded {media_type}: {filename}")
